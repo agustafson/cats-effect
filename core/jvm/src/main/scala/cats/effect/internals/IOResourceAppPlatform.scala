@@ -18,18 +18,21 @@ package cats
 package effect
 package internals
 
+import scala.concurrent.duration._
 import cats.Eval
 import cats.effect.{ContextShift, ExitCode, IO, Resource, Timer}
+import cats.implicits._
 
 private[effect] object IOResourceAppPlatform {
   def main(args: Array[String], contextShift: Eval[ContextShift[IO]], timer: Eval[Timer[IO]])(
     run: List[String] => Resource[IO, ExitCode]
   ): Unit = {
-    val code: Int = mainProcess(args, contextShift, timer)(run).unsafeRunSync().code
+    val (code, shutdownAction) = mainProcess(args, contextShift, timer)(run).map(_.code).allocated.unsafeRunSync()
     if (code == 0) {
       // Return naturally from main. This allows any non-daemon
       // threads to gracefully complete their work, and managed
       // environments to execute their own shutdown hooks.
+      shutdownAction.unsafeRunTimed(30.seconds)
       ()
     } else {
       sys.exit(code)
@@ -38,22 +41,17 @@ private[effect] object IOResourceAppPlatform {
 
   def mainProcess(args: Array[String], cs: Eval[ContextShift[IO]], timer: Eval[Timer[IO]])(
     run: List[String] => Resource[IO, ExitCode]
-  ): IO[ExitCode] = {
+  ): Resource[IO, ExitCode] = {
     val _ = cs.hashCode() + timer.hashCode()
-    run(args.toList).allocated
-      .flatMap {
-        case (exitCode, shutdownAction) =>
-          installHook(shutdownAction).map(_ => exitCode)
-      }
-      .handleErrorWith { e =>
-        IO {
-          Logger.reportFailure(e)
-          ExitCode.Error
+    Resource(
+      run(args.toList).allocated
+        .flatTap {
+          case (_, shutdownAction) => installShutdownHook(shutdownAction)
         }
-      }
+    )
   }
 
-  private def installHook(shutdownAction: IO[Unit]): IO[Unit] =
+  private def installShutdownHook(shutdownAction: IO[Unit]): IO[Unit] =
     IO {
       sys.addShutdownHook {
         // Should block the thread until all finalizers are executed

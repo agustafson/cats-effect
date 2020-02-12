@@ -26,30 +26,26 @@ private[effect] object IOResourceAppPlatform {
   def main(args: Array[String], cs: Eval[ContextShift[IO]], timer: Eval[Timer[IO]])(
     run: List[String] => Resource[IO, ExitCode]
   ): Unit =
-    mainProcess(args, cs, timer)(run).unsafeRunAsync {
+    mainProcess(args, cs, timer)(run).allocated.unsafeRunAsync {
       case Left(t) =>
         Logger.reportFailure(t)
         setExitCode(ExitCode.Error.code)
-      case Right(code) =>
+      case Right((code, shutdownAction)) =>
+        shutdownAction.unsafeRunTimed(30.seconds)
         setExitCode(code.code)
     }
 
   def mainProcess(args: Array[String], cs: Eval[ContextShift[IO]], timer: Eval[Timer[IO]])(
     run: List[String] => Resource[IO, ExitCode]
-  ): IO[ExitCode] =
-    run(args.toList)
-      .evalMap(exitCode => runKeepAlive(cs, timer)(IO(exitCode)))
-      .allocated
-      .flatMap {
-        case (exitCode, shutdownAction) =>
-          installHandler(shutdownAction).as(exitCode)
-      }
-      .handleErrorWith { e =>
-        IO {
-          Logger.reportFailure(e)
-          ExitCode.Error
+  ): Resource[IO, ExitCode] =
+    Resource(
+      run(args.toList)
+        .evalMap(exitCode => runKeepAlive(cs, timer)(IO(exitCode)))
+        .allocated
+        .flatTap {
+          case (_, shutdownAction) => installHandler(shutdownAction)
         }
-      }
+    )
 
   /**
    * Sets the exit code with `process.exitCode = code` for runtimes
